@@ -39,18 +39,20 @@ def index_docs():
 
     # 3. Ingest documents
     docs_dir = "data/api_docs"
+    sub_tenant_id = "7kzhuidiiw"
     ingest_ids = []
 
     for root, dirs, files in os.walk(docs_dir):
         for file in files:
             if file.endswith(".json"):
                 file_path = os.path.join(root, file)
-                print(f"Ingesting {file_path}...")
+                print(f"Ingesting {file_path} into sub_tenant {sub_tenant_id}...")
                 with open(file_path, "rb") as f:
                     try:
                         response = client.context.ingest(
                             type="knowledge",
                             tenant_id=tenant_id,
+                            sub_tenant_id=sub_tenant_id,
                             documents=[
                                 (file, f, "application/json")
                             ],

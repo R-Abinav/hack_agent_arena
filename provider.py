@@ -3,9 +3,9 @@ import time
 from typing import List, Dict, Any, Optional
 
 class LLMProvider:
-    def __init__(self):
-        self.model = os.environ.get("MODEL", "llama-3.3-70b-versatile")
-        self.provider = os.environ.get("LLM_PROVIDER", "groq").lower()
+    def __init__(self, provider: Optional[str] = None, model: Optional[str] = None):
+        self.provider = (provider or os.environ.get("LLM_PROVIDER", "groq")).lower()
+        self.model = model or os.environ.get("MODEL", "llama-3.3-70b-versatile")
         
         # Initialize clients lazily
         self._openai_client = None
@@ -99,8 +99,14 @@ class LLMProvider:
     def _call_openai(self, messages, system_prompt, max_tokens, temperature):
         client = self._get_openai_client()
         full_messages = [{"role": "system", "content": system_prompt}] + messages
+        model_name = self.model
+        if model_name.startswith("ollama/"):
+            model_name = model_name[7:]
+        elif model_name.startswith("openai/"):
+            model_name = model_name[7:]
+            
         resp = client.chat.completions.create(
-            model=self.model,
+            model=model_name,
             messages=full_messages,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -148,5 +154,5 @@ class LLMProvider:
         ))
         return resp.text
 
-def get_llm():
-    return LLMProvider()
+def get_llm(provider: Optional[str] = None, model: Optional[str] = None):
+    return LLMProvider(provider=provider, model=model)

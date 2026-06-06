@@ -51,40 +51,39 @@ except ImportError:
 
 # ---- config ---------------------------------------------------------------
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "ollama")
-MODEL = os.environ.get("MODEL", "phi3.5:latest")
+MODEL = os.environ.get("MODEL", "")
 DATASET = os.environ.get("APPWORLD_DATASET", "dev")          # dev | test_normal | test_challenge
 EXPERIMENT = os.environ.get("APPWORLD_EXPERIMENT", "silvanites")
 MAX_INTERACTIONS = int(os.environ.get("MAX_INTERACTIONS", "50"))
-MAX_TASKS = int(os.environ.get("MAX_TASKS", "1"))           #fafo we do!
+MAX_TASKS = int(os.environ.get("MAX_TASKS", "2"))           #fafo we do!
 USE_HYDRA = os.environ.get("USE_HYDRA", "false").lower() == "true"
 
 llm = get_llm(provider=LLM_PROVIDER, model=MODEL)
 
 SYSTEM_PROMPT = """You are a Python coding agent in AppWorld (silvanites).
-Your goal is to solve the task using ONLY the `apis` object.
+Your response MUST be EXACTLY one Python code block. 
+FORBIDDEN: NO explanations, NO comments, NO conversational text, NO markdown outside the block.
+FORBIDDEN: NO hypothetical libraries (e.g. MelodyMatcher).
 
-MANDATORY RULES:
-1. **ONLY CODE**: Your response MUST be EXACTLY one Python code block. NO text, NO comments, NO explanations.
-2. **NO HALLUCINATION**: You MUST NOT import `spotipy`, `requests`, or any `silvanite_` libraries. They do not exist.
-3. **NO GUESSING**: If you don't know an API, you MUST call `apis.api_docs.show_api_doc`.
-4. **AUTH FIRST**: You MUST call `apis.supervisor.show_account_passwords()` first.
-5. **LOGIN**: You MUST call `apis.<app>.login(username=..., password=...)` to get an `access_token` before calling any app APIs.
-6. **PERSISTENCE**: Tokens and variables PERSIST. Store them and reuse them.
+STRICT GROUND RULES:
+1. **ONLY CODE**: Your response is executed directly. Any text will cause a SyntaxError.
+2. **NO GUESSING**: You MUST call `apis.api_docs.show_api_doc` for an API before using it.
+3. **AUTH FIRST**: You MUST call `apis.supervisor.show_account_passwords()` to get credentials.
+4. **LOGIN**: You MUST call `apis.<app>.login(...)` and store the `access_token` in a variable.
+5. **PERSISTENCE**: Variables (tokens, data) PERSIST between turns. DO NOT re-login if you already have a token.
 
 PHASED STRATEGY:
-STEP 1: Call `apis.supervisor.show_account_passwords()` AND `apis.api_docs.show_app_descriptions()`.
-STEP 2: Based on Step 1, `login` to the required app and store the `access_token`.
-STEP 3: Check documentation for the specific action using `apis.api_docs.show_api_doc`.
-STEP 4: Execute the action and call `apis.supervisor.complete_task()`.
-
-DO NOT write hypothetical code. DO NOT describe your plan. JUST write the Python code for the CURRENT step.
+PHASE 1 (CONTEXT): Call `apis.supervisor.show_account_passwords()` and `apis.api_docs.show_app_descriptions()`.
+PHASE 2 (GROUNDING): Call `apis.api_docs.show_api_descriptions(app_name='...')` and `apis.api_docs.show_api_doc(...)`.
+PHASE 3 (EXECUTION): Call `apis.<app>.login(...)` and then the action APIs.
+PHASE 4 (COMPLETION): Call `apis.supervisor.complete_task()`.
 """
 
 
-def call_llm(messages: list[dict], max_retries=3) -> str:
+def call_llm(messages: list[dict], system_prompt: str = SYSTEM_PROMPT, max_retries=3) -> str:
     for attempt in range(max_retries):
         try:
-            return llm.call(messages, SYSTEM_PROMPT)
+            return llm.call(messages, system_prompt)
         except Exception as e:
             if attempt == max_retries - 1:
                 raise
@@ -108,6 +107,87 @@ C_YELLOW = "\033[93m"
 C_BLUE = "\033[94m"
 C_CYAN = "\033[96m"
 C_RESET = "\033[0m"
+
+def spell_check(instruction: str, hydra_client=None, tenant_id=None) -> str:
+    print(f"{C_BLUE}  > Performing doc-aware spell check on instruction...{C_RESET}")
+    
+    if not instruction:
+        print("  > Instruction is empty, skipping spell check.")
+        return instruction
+
+    doc_context = ""
+    sub_tenant_id = "7kzhuidiiw"
+    
+    if hydra_client and tenant_id:
+        try:
+            print(f"  > Fetching doc context for spell check from HydraDB...")
+            res = hydra_client.query(
+                tenant_id=tenant_id,
+                sub_tenant_id=sub_tenant_id,
+                query=instruction,
+                type="knowledge",
+                query_by="hybrid",
+                mode="thinking"
+            )
+            if hasattr(res, 'data') and res.data and hasattr(res.data, 'chunks'):
+                top_chunks = res.data.chunks[:5]
+                context_parts = [f"Doc Snippet: {chunk.chunk_content}" for chunk in top_chunks]
+                doc_context = "\n".join(context_parts)
+        except Exception as e:
+            print(f"{C_RED}  ! HydraDB query error during spell check: {e}{C_RESET}")
+
+    spell_check_prompt = [
+        {
+            "role": "user", 
+            "content": (
+                f"STRICT TASK: Fix spelling and grammar errors in the instruction below. "
+                f"DO NOT add new information. DO NOT rewrite the task. DO NOT change the technical meaning. "
+                f"Use the API context ONLY to correct typos in app/API names.\n\n"
+                f"API Context:\n{doc_context}\n\n"
+                f"Instruction: {instruction}\n\n"
+                f"Return ONLY the corrected string."
+            )
+        }
+    ]
+    
+    corrected = call_llm(spell_check_prompt, "You are a conservative technical editor. Fix typos only.")
+    corrected = corrected.strip().strip('"').strip("'")
+    if not corrected or len(corrected) > len(instruction) * 1.5:
+        print(f"  > Corrected Instruction looks suspicious or empty, using original.")
+        return instruction
+    print(f"  > Corrected Instruction: {corrected}")
+    return corrected
+
+def get_error_fix_from_docs(error_output: str, failing_code: str, hydra_client, tenant_id) -> str:
+    print(f"{C_BLUE}  > Searching for a fix in API docs for the error...{C_RESET}")
+    if not hydra_client or not tenant_id:
+        return ""
+    
+    sub_tenant_id = "7kzhuidiiw"
+    query = f"Fix this error: {error_output}\nFailing code: {failing_code}"
+    
+    if not query or query.strip() == "Fix this error: \nFailing code:":
+        print("  > Query for error fix is empty, skipping.")
+        return ""
+
+    doc_context = ""
+    try:
+        res = hydra_client.query(
+            tenant_id=tenant_id,
+            sub_tenant_id=sub_tenant_id,
+            query=query,
+            type="knowledge",
+            query_by="hybrid",
+            mode="thinking"
+        )
+        if hasattr(res, 'data') and res.data and hasattr(res.data, 'chunks'):
+            top_chunks = res.data.chunks[:5]
+            context_parts = [f"Doc Snippet: {chunk.chunk_content}" for chunk in top_chunks]
+            doc_context = "\n".join(context_parts)
+    except Exception as e:
+        print(f"{C_RED}  ! HydraDB query error during error fix search: {e}{C_RESET}")
+        
+    return doc_context
 
 def query_hydra(hydra_client, tenant_id, sub_tenant_id, query_text, app_hint=None):
     if not hydra_client or not tenant_id:
@@ -152,6 +232,9 @@ def solve(world: AppWorld, hydra_client=None, tenant_id=None, sub_tenant_id=None
     sub_tenant_id = sub_tenant_id or os.environ.get("HYDRA_SUB_TENANT_ID", "7kzhuidiiw")
     tenant_id = tenant_id or os.environ.get("HYDRA_TENANT_ID", "appworld_silvanites")
 
+    # 0. Spell check the instruction
+    instruction = spell_check(world.task.instruction, hydra_client, tenant_id)
+
     # 1. Deterministic Hard-Coded Workflow
     init_code = '''
 try:
@@ -174,12 +257,12 @@ except Exception as e:
             app_hint = ", ".join(mentioned)
 
     # 2. Initial Hydra Query with app hints
-    hydra_context = query_hydra(hydra_client, tenant_id, sub_tenant_id, world.task.instruction, app_hint=app_hint)
+    hydra_context = query_hydra(hydra_client, tenant_id, sub_tenant_id, instruction, app_hint=app_hint)
 
     messages = [{
         "role": "user",
         "content": (
-            f"Task: {world.task.instruction}\n\n"
+            f"Task: {instruction}\n\n"
             f"{hydra_context}\n"
             "Step 1: Discover. Call `apis.supervisor.show_account_passwords()` and `apis.api_docs.show_app_descriptions()` now."
         ),
@@ -202,7 +285,10 @@ except Exception as e:
         # 3. Error parsing and fallback logic
         if "Exception:" in str(output) or "Traceback" in str(output) or "Error:" in str(output) or "SyntaxError" in str(output):
             print(f"{C_RED}  ! Error detected at step {step+1}. Hitting HydraDB for solution...{C_RESET}")
-            error_context = query_hydra(hydra_client, tenant_id, sub_tenant_id, f"Error: {output}\nTask: {world.task.instruction}", app_hint=app_hint)
+            # Use the new specialized error fix function
+            error_context = get_error_fix_from_docs(str(output), code, hydra_client, tenant_id)
+            if not error_context:
+                error_context = query_hydra(hydra_client, tenant_id, sub_tenant_id, f"Error: {output}\nTask: {instruction}", app_hint=app_hint)
             
             error_msg = (
                 f"Execution failed with the following error output:\n{output}\n\n"
@@ -237,7 +323,7 @@ except Exception as e:
                     "output": str(t["output"])[:500] + "..." if len(str(t["output"])) > 500 else str(t["output"])
                 })
 
-            summary_prompt = f"""Analyze this trajectory for Task: "{world.task.instruction}" (Status: {status}).
+            summary_prompt = f"""Analyze this trajectory for Task: "{instruction}" (Status: {status}).
 Distill it into a UNIVERSAL TECHNICAL PATTERN for the agent's global brain.
 
 CRITICAL INSTRUCTION: 
@@ -268,7 +354,7 @@ Doc: ...
             
             learning_payload = [{
                 "id": f"task_{world.task.id}",
-                "text": f"Task: {world.task.instruction}\nStatus: {status}\nLesson Learned: {lesson_learned}",
+                "text": f"Task: {instruction}\nStatus: {status}\nLesson Learned: {lesson_learned}",
                 "infer": True
             }]
             
@@ -336,13 +422,16 @@ def main() -> None:
             task_ids = task_ids[:MAX_TASKS]
     
     print(f"Running '{EXPERIMENT}' on {len(task_ids)} tasks with {LLM_PROVIDER}/{MODEL}")
+    
     for i, task_id in enumerate(task_ids, 1):
         print(f"[{i}/{len(task_ids)}] {task_id}")
         with AppWorld(task_id=task_id, experiment_name=EXPERIMENT) as world:
             try:
                 solve(world, hydra_client, tenant_id, sub_tenant_id)
-            except Exception as e:  # never let one task kill the whole run
-                print(f"  ! error: {e}")
+            except Exception as e:
+                print(f"  ! error in task {task_id}: {e}")
+                traceback.print_exc()
+    
     print(f"\nDone. Outputs in ./experiments/outputs/{EXPERIMENT}/")
     print("Hand that folder to the organizers (or zip and submit per instructions).")
 

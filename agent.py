@@ -53,8 +53,8 @@ except ImportError:
 MODEL = os.environ.get("MODEL", "groq/llama-3.3-70b-versatile")
 DATASET = os.environ.get("APPWORLD_DATASET", "dev")          # dev | test_normal | test_challenge
 EXPERIMENT = os.environ.get("APPWORLD_EXPERIMENT", "silvanites")
-MAX_INTERACTIONS = int(os.environ.get("MAX_INTERACTIONS", "30"))
-MAX_TASKS = int(os.environ.get("MAX_TASKS", "0"))            # 0 = all tasks in split
+MAX_INTERACTIONS = int(os.environ.get("MAX_INTERACTIONS", "50"))
+MAX_TASKS = int(os.environ.get("MAX_TASKS", "1"))            # 1 = run just one task by default
 USE_HYDRA = os.environ.get("USE_HYDRA", "false").lower() == "true"
 
 llm = get_llm()
@@ -63,22 +63,24 @@ SYSTEM_PROMPT = """You are an autonomous coding agent operating inside AppWorld 
 You complete the supervisor's task by writing Python code that the environment executes.
 
 STRATEGY:
-1. **Use Pre-fetched Info**: I have already provided you with account passwords and app descriptions. USE THEM.
-2. **Discover APIs**: Before acting on an app, call `apis.api_docs.show_api_descriptions(app_name='...')` and `apis.api_docs.show_api_doc(app_name='...', api_name='...')`.
-3. **Login First**: Most apps require a `login` call to get an `access_token`.
-4. **Inspect Returns**: Always print the results of your API calls to see the structure.
+1. **Discover & Authenticate**: 
+   - Use `apis.supervisor.show_account_passwords()` to get credentials.
+   - Use `apis.api_docs.show_app_descriptions()` to find the right app.
+   - Use `apis.api_docs.show_api_descriptions(app_name='...')` to find the login and relevant action APIs.
+   - **MANDATORY**: Call the app's `login` API first to get an `access_token`. Store it in a variable.
+2. **Execute Decisively**:
+   - Don't just look at docs; once you see the API you need, CALL IT.
+   - Use `apis.api_docs.show_api_doc(app_name='...', api_name='...')` if you are unsure of the exact parameters.
+3. **Verify & Finish**:
+   - Check the output of your actions.
+   - Once the task is done, call `apis.supervisor.complete_task(answer=...)`.
 
 RULES:
 - Reply with EXACTLY ONE Python code block per turn, nothing else.
-- A preloaded object `apis` is the ONLY way to interact with the apps.
-- Variables PERSIST across turns. Store tokens in variables!
-- **Learning from Memory**: You will be provided with 'Relevant Memory' from past tasks.
-    - [CORRECT PATTERNS]: These are successful strategies. RETAIN and REUSE them.
-    - [ERROR PATTERNS]: These are past failures. STICKILY AVOID them. Never repeat the same mistake.
-- **No Hallucination**: Never invent API names like `get_accounts()`. If you don't see it in the docs, it doesn't exist.
-- Work in small steps.
-- When and ONLY when the task is fully done, call:
-    apis.supervisor.complete_task(answer=<answer>)
+- Variables PERSIST across turns. RETAIN your `access_token`!
+- **Learning from Memory**: Use the provided 'Relevant Memory' to avoid past mistakes and reuse successful patterns.
+- **No Hallucination**: Only use APIs listed in the documentation.
+- When and ONLY when the task is fully done, call `apis.supervisor.complete_task`.
 """
 
 
@@ -152,7 +154,9 @@ except Exception as e:
     
     for step in range(MAX_INTERACTIONS):
         reply = call_llm(messages)
+        print(f"  --- Step {step+1} LLM Reply ---\n{reply}\n-----------------------")
         code = extract_code(reply)
+        print(f"  --- Step {step+1} Executing Code ---\n{code}\n-----------------------")
         output = world.execute(code)
         
         trajectory.append({"step": step, "code": code, "output": output})
@@ -161,10 +165,10 @@ except Exception as e:
         messages.append({"role": "assistant", "content": reply})
         
         # 3. Error parsing and fallback logic
-        if "Exception:" in output or "Traceback" in output or "Error:" in output or "SyntaxError" in output:
+        if "Exception:" in str(output) or "Traceback" in str(output) or "Error:" in str(output) or "SyntaxError" in str(output):
             messages.append({
                 "role": "user", 
-                "content": f"Execution failed with the following error output:\n{output}\nAnalyze the error, re-read the API docs if needed, fix the Python code, and try again."
+                "content": f"Execution failed with the following error output:\n{output}\n\nIMPORTANT: You hallucinated an API name or used it incorrectly. Check the API docs for the correct name and parameters before trying again."
             })
         else:
             messages.append({"role": "user", "content": f"Execution output:\n{output}"})
@@ -237,7 +241,7 @@ Format:
                 sub_tenant_id=sub_tenant_id,
                 memories=json.dumps(learning_payload)
             )
-            print(f"  ✓ Ingestion triggered. ID: {resp}")
+            print(f"  ✓ Ingestion response: {resp}")
         except Exception as e:
             print(f"  ! HydraDB ingestion error: {e}")
 
@@ -247,8 +251,9 @@ def main() -> None:
     hydra_client = None
     tenant_id = f"appworld_{EXPERIMENT}"
     api_key = os.environ.get("HYDRA_DB_API_KEY") or os.environ.get("HYDRA_DB_KEY")
+    base_url = os.environ.get("HYDRA_DB_URL")
     if USE_HYDRA and HydraDB and api_key:
-        hydra_client = HydraDB(token=api_key)
+        hydra_client = HydraDB(token=api_key, base_url=base_url)
         try:
             hydra_client.tenants.create(tenant_id=tenant_id)
             print("Waiting for HydraDB tenant to be ready...")

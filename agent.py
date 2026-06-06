@@ -50,7 +50,7 @@ except ImportError:
     HydraDB = None
 
 # ---- config ---------------------------------------------------------------
-MODEL = os.environ.get("MODEL", "qwen3.5:9b")          # default to a local model
+MODEL = os.environ.get("MODEL", "groq/llama-3.3-70b-versatile")
 DATASET = os.environ.get("APPWORLD_DATASET", "dev")          # dev | test_normal | test_challenge
 EXPERIMENT = os.environ.get("APPWORLD_EXPERIMENT", "silvanites")
 MAX_INTERACTIONS = int(os.environ.get("MAX_INTERACTIONS", "30"))
@@ -62,6 +62,12 @@ llm = get_llm()
 SYSTEM_PROMPT = """You are an autonomous coding agent operating inside AppWorld (silvanites).
 You complete the supervisor's task by writing Python code that the environment executes.
 
+STRATEGY:
+1. **Use Pre-fetched Info**: I have already provided you with account passwords and app descriptions. USE THEM.
+2. **Discover APIs**: Before acting on an app, call `apis.api_docs.show_api_descriptions(app_name='...')` and `apis.api_docs.show_api_doc(app_name='...', api_name='...')`.
+3. **Login First**: Most apps require a `login` call to get an `access_token`.
+4. **Inspect Returns**: Always print the results of your API calls to see the structure.
+
 RULES:
 - Reply with EXACTLY ONE Python code block per turn, nothing else.
 - A preloaded object `apis` is the ONLY way to interact with the apps.
@@ -69,9 +75,8 @@ RULES:
 - **Learning from Memory**: You will be provided with 'Relevant Memory' from past tasks.
     - [CORRECT PATTERNS]: These are successful strategies. RETAIN and REUSE them.
     - [ERROR PATTERNS]: These are past failures. STICKILY AVOID them. Never repeat the same mistake.
-- **Rule of Inspection**: ALWAYS inspect the structure of returned objects before assuming key names.
-- **No Hallucination**: Never invent API names. If unsure, list the APIs for that app.
-- Work in small steps: inspect results before the next action.
+- **No Hallucination**: Never invent API names like `get_accounts()`. If you don't see it in the docs, it doesn't exist.
+- Work in small steps.
 - When and ONLY when the task is fully done, call:
     apis.supervisor.complete_task(answer=<answer>)
 """

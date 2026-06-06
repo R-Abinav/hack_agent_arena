@@ -4,3 +4,4 @@ openai
 google-generativeai
 python-dotenv
 hydradb-sdk>=2,<3
+litellm

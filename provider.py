@@ -4,13 +4,23 @@ from typing import List, Dict, Any, Optional
 
 class LLMProvider:
     def __init__(self):
-        self.model = os.environ.get("MODEL", "qwen3.5:9b")
-        self.provider = os.environ.get("LLM_PROVIDER", "ollama").lower()
+        self.model = os.environ.get("MODEL", "llama-3.3-70b-versatile")
+        self.provider = os.environ.get("LLM_PROVIDER", "groq").lower()
         
         # Initialize clients lazily
         self._openai_client = None
         self._anthropic_client = None
         self._gemini_client = None
+        self._groq_client = None
+
+    def _get_groq_client(self):
+        if self._groq_client is None:
+            from groq import Groq
+            api_key = os.environ.get("GROQ_API_KEY")
+            if not api_key:
+                raise ValueError("GROQ_API_KEY not found in environment")
+            self._groq_client = Groq(api_key=api_key)
+        return self._groq_client
 
     def _get_openai_client(self):
         if self._openai_client is None:
@@ -40,7 +50,9 @@ class LLMProvider:
         return self._gemini_client
 
     def call(self, messages: List[Dict[str, str]], system_prompt: str, max_tokens: int = 1500, temperature: float = 0.0) -> str:
-        if self.provider == "ollama" or self.provider == "openai":
+        if self.provider == "groq":
+            return self._call_groq(messages, system_prompt, max_tokens, temperature)
+        elif self.provider == "ollama" or self.provider == "openai":
             return self._call_openai(messages, system_prompt, max_tokens, temperature)
         elif self.provider == "anthropic":
             return self._call_anthropic(messages, system_prompt, max_tokens, temperature)
@@ -48,6 +60,22 @@ class LLMProvider:
             return self._call_gemini(messages, system_prompt, max_tokens, temperature)
         else:
             raise ValueError(f"Unknown provider: {self.provider}")
+
+    def _call_groq(self, messages, system_prompt, max_tokens, temperature):
+        client = self._get_groq_client()
+        full_messages = [{"role": "system", "content": system_prompt}] + messages
+        # Remove groq/ prefix if present
+        model_name = self.model
+        if model_name.startswith("groq/"):
+            model_name = model_name[5:]
+            
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=full_messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return resp.choices[0].message.content
 
     def _call_openai(self, messages, system_prompt, max_tokens, temperature):
         client = self._get_openai_client()

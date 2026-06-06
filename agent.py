@@ -50,39 +50,34 @@ except ImportError:
     HydraDB = None
 
 # ---- config ---------------------------------------------------------------
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq")
-MODEL = os.environ.get("MODEL", "groq/llama-3.3-70b-versatile")
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "ollama")
+MODEL = os.environ.get("MODEL", "phi3.5:latest")
 DATASET = os.environ.get("APPWORLD_DATASET", "dev")          # dev | test_normal | test_challenge
 EXPERIMENT = os.environ.get("APPWORLD_EXPERIMENT", "silvanites")
 MAX_INTERACTIONS = int(os.environ.get("MAX_INTERACTIONS", "50"))
-MAX_TASKS = int(os.environ.get("MAX_TASKS", "5"))            # 5 tasks by default
+MAX_TASKS = int(os.environ.get("MAX_TASKS", "1"))           #fafo we do!
 USE_HYDRA = os.environ.get("USE_HYDRA", "false").lower() == "true"
 
 llm = get_llm(provider=LLM_PROVIDER, model=MODEL)
 
-SYSTEM_PROMPT = """You are an autonomous coding agent operating inside AppWorld (silvanites).
-You complete the supervisor's task by writing Python code that the environment executes.
+SYSTEM_PROMPT = """You are a Python coding agent in AppWorld (silvanites).
+Your goal is to solve the task using ONLY the `apis` object.
 
-CRITICAL GROUND RULES (ZERO TOLERANCE):
-1. **ZERO SPELLING MISTAKES**: You MUST double-check every API name, parameter name, and app name against the documentation before calling it. A single typo will fail the task.
-2. **AUTHENTICATION PROTOCOL**:
-   - Many APIs REQUIRE an `access_token`. You MUST obtain this by calling `apis.<app>.login(username=..., password=...)`.
-   - To get the `username` and `password`, call `apis.supervisor.show_account_passwords()`.
-   - **NEVER** call an API that requires `access_token` if you do not have a valid token variable already stored.
-3. **MANDATORY DOC CHECK**: Before calling an API for the first time, you MUST call `apis.api_docs.show_api_doc(app_name='...', api_name='...')` to verify the exact spelling and required parameters. Do not assume or guess.
-4. **ONLY THE 'apis' OBJECT**: You have NO access to external libraries (e.g., `spotipy`, `requests`). All interactions MUST happen through the pre-loaded `apis` object.
-5. **NO HALLUCINATIONS**: Do not invent modules, functions, or apps (e.g., no `silvanite_spotify`). Only use what is discovered via `api_docs`.
-6. **EXACT BLOCK**: Reply with EXACTLY ONE Python code block per turn. No preambles, no conversational filler, no explanations.
-7. **STATE PERSISTENCE**: Variables (especially `access_token`) PERSIST across turns. Define them once and reuse them.
+MANDATORY RULES:
+1. **ONLY CODE**: Your response MUST be EXACTLY one Python code block. NO text, NO comments, NO explanations.
+2. **NO HALLUCINATION**: You MUST NOT import `spotipy`, `requests`, or any `silvanite_` libraries. They do not exist.
+3. **NO GUESSING**: If you don't know an API, you MUST call `apis.api_docs.show_api_doc`.
+4. **AUTH FIRST**: You MUST call `apis.supervisor.show_account_passwords()` first.
+5. **LOGIN**: You MUST call `apis.<app>.login(username=..., password=...)` to get an `access_token` before calling any app APIs.
+6. **PERSISTENCE**: Tokens and variables PERSIST. Store them and reuse them.
 
-STRATEGY (FOLLOW STEP-BY-STEP):
-1. **Discovery**: Call `apis.supervisor.show_account_passwords()` and `apis.api_docs.show_app_descriptions()` to map your environment.
-2. **Authentication**: Use the discovered credentials to `login` to the necessary apps and store the `access_token`.
-3. **Verification**: Call `apis.api_docs.show_api_doc` for every action you intend to take. Check the spelling of every argument.
-4. **Execution**: Write the Python code to perform the task using the verified API calls.
-5. **Completion**: Call `apis.supervisor.complete_task(answer=...)` ONLY when the objective is fully achieved.
+PHASED STRATEGY:
+STEP 1: Call `apis.supervisor.show_account_passwords()` AND `apis.api_docs.show_app_descriptions()`.
+STEP 2: Based on Step 1, `login` to the required app and store the `access_token`.
+STEP 3: Check documentation for the specific action using `apis.api_docs.show_api_doc`.
+STEP 4: Execute the action and call `apis.supervisor.complete_task()`.
 
-Relevant Context (Memory & API Docs): Use this to find correct patterns and avoid repeating past spelling or logic errors.
+DO NOT write hypothetical code. DO NOT describe your plan. JUST write the Python code for the CURRENT step.
 """
 
 
@@ -114,29 +109,42 @@ C_BLUE = "\033[94m"
 C_CYAN = "\033[96m"
 C_RESET = "\033[0m"
 
-def query_hydra(hydra_client, tenant_id, sub_tenant_id, query_text):
+def query_hydra(hydra_client, tenant_id, sub_tenant_id, query_text, app_hint=None):
     if not hydra_client or not tenant_id:
         return ""
-    try:
-        print(f"{C_BLUE}  > HITTING HYDRA DB: query='{query_text[:50]}...'{C_RESET}")
-        res = hydra_client.query(
-            tenant_id=tenant_id,
-            sub_tenant_id=sub_tenant_id,
-            query=query_text,
-            type="all",
-            query_by="hybrid",
-            mode="thinking"
-        )
-        if hasattr(res, 'data') and res.data and hasattr(res.data, 'chunks'):
-            top_chunks = res.data.chunks[:10]
-            context_parts = []
-            for i, chunk in enumerate(top_chunks, 1):
-                context_parts.append(f"Context {i}: {chunk.chunk_content}")
-            if context_parts:
-                print(f"{C_GREEN}  > Retrieved {len(context_parts)} context chunks from HydraDB.{C_RESET}")
-                return "\nRelevant Context (Memory & API Docs):\n" + "\n".join(context_parts) + "\n"
-    except Exception as e:
-        print(f"{C_RED}  ! HydraDB query error: {e}{C_RESET}")
+    
+    queries = [query_text]
+    if app_hint:
+        queries.append(f"API documentation for {app_hint}")
+    
+    all_context = []
+    seen_chunks = set()
+    
+    for q in queries:
+        try:
+            print(f"{C_BLUE}  > HITTING HYDRA DB: query='{q[:50]}...'{C_RESET}")
+            res = hydra_client.query(
+                tenant_id=tenant_id,
+                sub_tenant_id=sub_tenant_id,
+                query=q,
+                type="all",
+                query_by="hybrid",
+                mode="thinking"
+            )
+            if hasattr(res, 'data') and res.data and hasattr(res.data, 'chunks'):
+                new_chunks = 0
+                for chunk in res.data.chunks[:5]:
+                    if chunk.chunk_id not in seen_chunks:
+                        all_context.append(f"Context: {chunk.chunk_content}")
+                        seen_chunks.add(chunk.chunk_id)
+                        new_chunks += 1
+                if new_chunks > 0:
+                    print(f"{C_GREEN}  > Retrieved {new_chunks} NEW context chunks from HydraDB for '{q[:20]}'.{C_RESET}")
+        except Exception as e:
+            print(f"{C_RED}  ! HydraDB query error for '{q[:20]}': {e}{C_RESET}")
+            
+    if all_context:
+        return "\nRelevant Context (Memory & API Docs):\n" + "\n".join(all_context) + "\n"
     return ""
 
 def solve(world: AppWorld, hydra_client=None, tenant_id=None, sub_tenant_id=None) -> None:
@@ -156,16 +164,24 @@ except Exception as e:
 '''
     init_output = world.execute(init_code)
     
-    # 2. Initial Hydra Query
-    hydra_context = query_hydra(hydra_client, tenant_id, sub_tenant_id, world.task.instruction)
+    # Extract app names from init_output for a better query
+    app_hint = None
+    if "=== APP DESCRIPTIONS ===" in str(init_output):
+        # Rough extraction of mentioned apps
+        apps = ["spotify", "gmail", "amazon", "todoist", "venmo", "splitwise", "phone", "simple_note"]
+        mentioned = [a for a in apps if a in str(init_output).lower()]
+        if mentioned:
+            app_hint = ", ".join(mentioned)
+
+    # 2. Initial Hydra Query with app hints
+    hydra_context = query_hydra(hydra_client, tenant_id, sub_tenant_id, world.task.instruction, app_hint=app_hint)
 
     messages = [{
         "role": "user",
         "content": (
-            f"Supervisor: {world.task.supervisor}\n\n"
             f"Task: {world.task.instruction}\n\n"
-            f"Pre-fetched Initialization Output:\n{init_output}\n{hydra_context}\n"
-            "Begin. Remember: one python code block per turn. Store tokens in variables."
+            f"{hydra_context}\n"
+            "Step 1: Discover. Call `apis.supervisor.show_account_passwords()` and `apis.api_docs.show_app_descriptions()` now."
         ),
     }]
     
@@ -186,7 +202,7 @@ except Exception as e:
         # 3. Error parsing and fallback logic
         if "Exception:" in str(output) or "Traceback" in str(output) or "Error:" in str(output) or "SyntaxError" in str(output):
             print(f"{C_RED}  ! Error detected at step {step+1}. Hitting HydraDB for solution...{C_RESET}")
-            error_context = query_hydra(hydra_client, tenant_id, sub_tenant_id, f"Error: {output}\nTask: {world.task.instruction}")
+            error_context = query_hydra(hydra_client, tenant_id, sub_tenant_id, f"Error: {output}\nTask: {world.task.instruction}", app_hint=app_hint)
             
             error_msg = (
                 f"Execution failed with the following error output:\n{output}\n\n"

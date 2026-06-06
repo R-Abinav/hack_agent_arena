@@ -54,7 +54,7 @@ MODEL = os.environ.get("MODEL", "groq/llama-3.3-70b-versatile")
 DATASET = os.environ.get("APPWORLD_DATASET", "dev")          # dev | test_normal | test_challenge
 EXPERIMENT = os.environ.get("APPWORLD_EXPERIMENT", "silvanites")
 MAX_INTERACTIONS = int(os.environ.get("MAX_INTERACTIONS", "50"))
-MAX_TASKS = int(os.environ.get("MAX_TASKS", "1"))            # 1 = run just one task by default
+MAX_TASKS = int(os.environ.get("MAX_TASKS", "5"))            # 5 tasks by default
 USE_HYDRA = os.environ.get("USE_HYDRA", "false").lower() == "true"
 
 llm = get_llm()
@@ -78,8 +78,8 @@ STRATEGY:
 RULES:
 - Reply with EXACTLY ONE Python code block per turn, nothing else.
 - Variables PERSIST across turns. RETAIN your `access_token`!
-- **Learning from Memory**: Use the provided 'Relevant Memory' to avoid past mistakes and reuse successful patterns.
-- **No Hallucination**: Only use APIs listed in the documentation.
+- **Learning from HydraDB**: Use the provided 'Relevant Context' which contains both past successful patterns/error fixes AND relevant API documentation snippets.
+- **No Hallucination**: Only use APIs listed in the documentation or provided context.
 - When and ONLY when the task is fully done, call `apis.supervisor.complete_task`.
 """
 
@@ -126,7 +126,7 @@ except Exception as e:
     hydra_context = ""
     if hydra_client and tenant_id:
         try:
-            print(f"  > Querying Global Memory: tenant={tenant_id}")
+            print(f"  > Querying Global Memory & Docs: tenant={tenant_id}")
             res = hydra_client.query(
                 tenant_id=tenant_id,
                 sub_tenant_id=sub_tenant_id,
@@ -135,8 +135,16 @@ except Exception as e:
                 query_by="hybrid",
                 mode="thinking"
             )
-            if hasattr(res, 'data') and res.data:
-                hydra_context = f"\nRelevant Memory (Lessons from past runs):\n{res.data}\n"
+            if hasattr(res, 'data') and res.data and hasattr(res.data, 'chunks'):
+                # Take top 10 most relevant chunks to provide enough doc context
+                top_chunks = res.data.chunks[:10]
+                context_parts = []
+                for i, chunk in enumerate(top_chunks, 1):
+                    context_parts.append(f"Context {i}: {chunk.chunk_content}")
+                
+                if context_parts:
+                    hydra_context = "\nRelevant Context (Memory & API Docs):\n" + "\n".join(context_parts) + "\n"
+                    print(f"  > Retrieved {len(context_parts)} relevant context chunks from HydraDB.")
         except Exception as e:
             print(f"  ! HydraDB query error: {e}")
 
@@ -202,14 +210,21 @@ CRITICAL INSTRUCTION:
 - DO NOT include the "answer" to the task.
 - FOCUS ONLY on API syntax, parameter names, error recovery steps, and logical workflows.
 
-Format:
+If any errors occurred and were fixed, follow this mandatory logging format for each error:
+Error: <error_msg>
+Fix: <How to fix error>
+Doc: <The specific API documentation or parameter rule that was violated/corrected>
+
+Format the final response as:
 [CORRECT API PATTERN]
 - <Which API was called and with what argument types/keys?>
 - <Logic: e.g., 'Must login to Spotify before calling show_library'>
 
-[ERROR AVOIDANCE]
-- <The specific error/misconception (e.g., 'Thought field was "id", actually "song_id"')>
-- <The exact code fix that solved it>
+[ERROR FIX LOGS]
+(Repeat for each error fixed)
+Error: ...
+Fix: ...
+Doc: ...
 
 [UNIVERSAL RULE]
 - <A general rule for this API/App that applies to ALL users>
@@ -222,15 +237,29 @@ Format:
                 "infer": True
             }]
             
-            # Also ingest specific error fixes if they happened
+            # Also ingest specific error fixes if they happened, following the requested format
             for i in range(1, len(trajectory)):
                 out_prev = str(trajectory[i-1]["output"])
                 out_curr = str(trajectory[i]["output"])
                 if any(x in out_prev for x in ["Exception", "Error", "Traceback", "SyntaxError"]):
                     if not any(x in out_curr for x in ["Exception", "Error", "Traceback", "SyntaxError"]):
+                        # Request a concise Error/Fix/Doc summary for this specific step
+                        step_summary_prompt = f"""Distill this specific error fix into the following format:
+Error: <error_msg>
+Fix: <How to fix error>
+Doc: <For api doc>
+
+Trajectory step {i}:
+Failed Code: {trajectory[i-1]['code']}
+Error: {out_prev}
+Fixed Code: {trajectory[i]['code']}
+Fixed Output: {out_curr}
+"""
+                        step_lesson = llm.call([{"role": "user", "content": step_summary_prompt}], "You are an expert AppWorld debugger.")
+                        
                         learning_payload.append({
                             "id": f"fix_{world.task.id}_{i}",
-                            "text": f"Error fix for task '{world.task.instruction}':\nFailed Code: {trajectory[i-1]['code']}\nError: {out_prev}\nFixed Code: {trajectory[i]['code']}",
+                            "text": step_lesson,
                             "infer": True
                         })
 
@@ -256,20 +285,19 @@ def main() -> None:
         hydra_client = HydraDB(token=api_key, base_url=base_url)
         try:
             hydra_client.tenants.create(tenant_id=tenant_id)
-            print("Waiting for HydraDB tenant to be ready...")
-            for _ in range(12):
-                status = hydra_client.tenants.status(tenant_id=tenant_id)
-                if status.data.infra.ready_for_ingestion:
-                    print("HydraDB tenant is ready.")
-                    break
-                time.sleep(5)
-        except Exception as e:
-            print(f"HydraDB init warning: {e}")
+            pass
+        except Exception:
+            pass
 
-    task_ids = load_task_ids(DATASET)
-    if MAX_TASKS:
-        task_ids = task_ids[:MAX_TASKS]
-    print(f"Running '{EXPERIMENT}' on {len(task_ids)} '{DATASET}' tasks with {MODEL}")
+    task_id_override = os.environ.get("TASK_ID")
+    if task_id_override:
+        task_ids = [task_id_override]
+    else:
+        task_ids = load_task_ids(DATASET)
+        if MAX_TASKS:
+            task_ids = task_ids[:MAX_TASKS]
+    
+    print(f"Running '{EXPERIMENT}' on {len(task_ids)} tasks with {MODEL}")
     for i, task_id in enumerate(task_ids, 1):
         print(f"[{i}/{len(task_ids)}] {task_id}")
         with AppWorld(task_id=task_id, experiment_name=EXPERIMENT) as world:

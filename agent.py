@@ -38,16 +38,18 @@ except Exception:
     pass
 
 from appworld import AppWorld, load_task_ids
-import anthropic
+import litellm
 
 # ---- config ---------------------------------------------------------------
-MODEL = os.environ.get("MODEL", "claude-opus-4-8")          # or claude-sonnet-4-6
+# MODEL is litellm's "provider/model" string, so you can point the agent at any
+# backend by setting MODEL + the matching key in .env (see README):
+#   anthropic/claude-haiku-4-5   gemini/gemini-2.0-flash   groq/llama-3.3-70b-versatile
+#   openrouter/...               ollama/llama3.1 (fully local)
+MODEL = os.environ.get("MODEL", "groq/llama-3.3-70b-versatile")
 DATASET = os.environ.get("APPWORLD_DATASET", "dev")          # dev | test_normal | test_challenge
 EXPERIMENT = os.environ.get("APPWORLD_EXPERIMENT", "team_demo")
 MAX_INTERACTIONS = int(os.environ.get("MAX_INTERACTIONS", "30"))
 MAX_TASKS = int(os.environ.get("MAX_TASKS", "0"))            # 0 = all tasks in split
-
-client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
 
 SYSTEM_PROMPT = """You are an autonomous coding agent operating inside AppWorld.
 You complete the supervisor's task by writing Python code that the environment executes.
@@ -74,14 +76,13 @@ RULES:
 
 
 def call_llm(messages: list[dict]) -> str:
-    resp = client.messages.create(
+    resp = litellm.completion(
         model=MODEL,
-        system=SYSTEM_PROMPT,
-        messages=messages,
+        messages=[{"role": "system", "content": SYSTEM_PROMPT}, *messages],
         max_tokens=1500,
-        temperature=0.0,
+        num_retries=8,   # ride out free-tier rate limits (429) with backoff
     )
-    return "".join(b.text for b in resp.content if b.type == "text")
+    return resp.choices[0].message.content or ""
 
 
 def extract_code(text: str) -> str:

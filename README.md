@@ -17,17 +17,24 @@ cd hack_agent_arena
 bash setup.sh                 # installs uv+py3.11, appworld + data, creates .env; verifies
 source .venv/bin/activate
 ```
-Then add your LLM key to **`.env`**:
-```
-ANTHROPIC_API_KEY=sk-...
-```
-> **No key? You can run a local model.** AppWorld itself needs no API key — you can
-> explore tasks (`appworld play`) and hand-solve them fully offline. Only the agent's
-> "brain" needs a model. The starter uses Anthropic by default, but `call_llm` in
-> `agent.py` is swappable: point it at any provider, including a local model via
-> [Ollama](https://ollama.com) (its OpenAI-compatible endpoint, or `litellm`). Small
-> local models score well below frontier models on AppWorld, but they're great for
-> building and debugging your agent loop for free.
+Then give the agent a model. **For fair scoring, everyone runs the same model:
+Groq's Llama 3.3 70B — free, fast, no billing, no card.**
+
+1. Get a free key at **[console.groq.com](https://console.groq.com)** → sign in with
+   GitHub/Google → **API Keys → Create**.
+2. Put it in **`.env`**:
+   ```
+   GROQ_API_KEY=...
+   ```
+3. That's it — the agent already defaults to `MODEL=groq/llama-3.3-70b-versatile`.
+   It runs in the cloud, so any laptop works — no GPU needed.
+
+> The agent runs on [litellm](https://docs.litellm.ai), so `MODEL` is a
+> `provider/model` string. You may use a different backend while **developing**
+> (`gemini/gemini-2.0-flash`, `anthropic/claude-haiku-4-5`, `ollama/llama3.1`, …),
+> but **submitted/scored runs must use `groq/llama-3.3-70b-versatile`** so every
+> team is compared on equal footing. (AppWorld itself needs no key — you can
+> `appworld play` and hand-solve tasks offline.)
 
 ## 2. Smoke-test the starter agent (2 tasks)
 ```bash

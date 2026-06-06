@@ -98,11 +98,10 @@ def extract_code(text: str) -> str:
 
 
 def solve(world: AppWorld, hydra_client=None, tenant_id=None) -> None:
-    # Ensure consistent and clean sub_tenant_id
-    # We'll use the supervisor's name slugified.
-    sub_tenant_id = re.sub(r'[^a-zA-Z0-9_]', '_', str(world.task.supervisor).lower())
-    if not sub_tenant_id:
-        sub_tenant_id = "default_agent_memory"
+    # We use a GLOBAL sub_tenant_id for the agent's "brain".
+    # This ensures lessons learned in Task A (e.g., how to use Spotify API)
+    # are immediately available for Task B, even if the supervisor is different.
+    sub_tenant_id = "global_agent_memory"
 
     # 1. Deterministic Hard-Coded Workflow
     init_code = '''
@@ -116,11 +115,11 @@ except Exception as e:
 '''
     init_output = world.execute(init_code)
     
-    # 2. Query HydraDB for relevant past knowledge (if available)
+    # 2. Query HydraDB for relevant past knowledge (Global retrieval)
     hydra_context = ""
     if hydra_client and tenant_id:
         try:
-            print(f"  > Querying HydraDB: tenant={tenant_id}, sub_tenant={sub_tenant_id}")
+            print(f"  > Querying Global Memory: tenant={tenant_id}")
             res = hydra_client.query(
                 tenant_id=tenant_id,
                 sub_tenant_id=sub_tenant_id,
@@ -187,22 +186,24 @@ except Exception as e:
                 })
 
             summary_prompt = f"""Analyze this trajectory for Task: "{world.task.instruction}" (Status: {status}).
-Distill it into a structured 'Agent Guide' for future runs.
+Distill it into a UNIVERSAL TECHNICAL PATTERN for the agent's global brain.
 
-Format your response as follows:
-[CORRECT PATTERN]
-- <Specific API call or logic that worked perfectly>
-- <Why it worked>
+CRITICAL INSTRUCTION: 
+- DO NOT include specific names, phone numbers, emails, or values found in the data.
+- DO NOT include the "answer" to the task.
+- FOCUS ONLY on API syntax, parameter names, error recovery steps, and logical workflows.
 
-[ERROR PATTERN]
-- <Specific code or assumption that triggered a failure>
-- <The error message received>
-- <How to avoid this exactly (e.g., 'Always check field X before Y')>
+Format:
+[CORRECT API PATTERN]
+- <Which API was called and with what argument types/keys?>
+- <Logic: e.g., 'Must login to Spotify before calling show_library'>
 
-[GOLDEN RULE]
-- <One-sentence mandatory instruction for this specific task type>
+[ERROR AVOIDANCE]
+- <The specific error/misconception (e.g., 'Thought field was "id", actually "song_id"')>
+- <The exact code fix that solved it>
 
-Keep it technical, concise, and focused on code/APIs.
+[UNIVERSAL RULE]
+- <A general rule for this API/App that applies to ALL users>
 """
             lesson_learned = llm.call([{"role": "user", "content": summary_prompt}], "You are an expert AppWorld debugger.")
             

@@ -30,6 +30,9 @@ Run:
 
 import os
 import re
+import time
+import json
+import traceback
 
 try:  # optional: load ANTHROPIC_API_KEY etc. from a local .env
     from dotenv import load_dotenv
@@ -38,80 +41,220 @@ except Exception:
     pass
 
 from appworld import AppWorld, load_task_ids
-import anthropic
+from provider import get_llm
+
+try:
+    from hydra_db import HydraDB
+    from hydra_db.errors import TooManyRequestsError, InternalServerError, ServiceUnavailableError
+except ImportError:
+    HydraDB = None
 
 # ---- config ---------------------------------------------------------------
-MODEL = os.environ.get("MODEL", "claude-opus-4-8")          # or claude-sonnet-4-6
+MODEL = os.environ.get("MODEL", "qwen3.5:9b")          # default to a local model
 DATASET = os.environ.get("APPWORLD_DATASET", "dev")          # dev | test_normal | test_challenge
-EXPERIMENT = os.environ.get("APPWORLD_EXPERIMENT", "team_demo")
+EXPERIMENT = os.environ.get("APPWORLD_EXPERIMENT", "silvanites")
 MAX_INTERACTIONS = int(os.environ.get("MAX_INTERACTIONS", "30"))
 MAX_TASKS = int(os.environ.get("MAX_TASKS", "0"))            # 0 = all tasks in split
+USE_HYDRA = os.environ.get("USE_HYDRA", "false").lower() == "true"
 
-client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
+llm = get_llm()
 
-SYSTEM_PROMPT = """You are an autonomous coding agent operating inside AppWorld.
+SYSTEM_PROMPT = """You are an autonomous coding agent operating inside AppWorld (silvanites).
 You complete the supervisor's task by writing Python code that the environment executes.
 
 RULES:
-- Reply with EXACTLY ONE Python code block per turn, nothing else:
-  ```python
-  # your code
-  ```
-- A preloaded object `apis` is the ONLY way to interact with the apps. Whatever
-  you print() is returned to you as the next observation.
-- You do NOT know the APIs in advance. Discover them at runtime:
-    print(apis.api_docs.show_app_descriptions())
-    print(apis.api_docs.show_api_descriptions(app_name='<app>'))
-    print(apis.api_docs.show_api_doc(app_name='<app>', api_name='<api>'))
-- To act on the supervisor's accounts, get credentials and log in:
-    print(apis.supervisor.show_account_passwords())
-    # then call that app's login API to get an access_token, and pass it onward.
-- Work in small steps: inspect results before the next action. Never invent API
-  names or fields — look them up first.
+- Reply with EXACTLY ONE Python code block per turn, nothing else.
+- A preloaded object `apis` is the ONLY way to interact with the apps.
+- Variables PERSIST across turns. Store tokens in variables!
+- **Learning from Memory**: You will be provided with 'Relevant Memory' from past tasks.
+    - [CORRECT PATTERNS]: These are successful strategies. RETAIN and REUSE them.
+    - [ERROR PATTERNS]: These are past failures. STICKILY AVOID them. Never repeat the same mistake.
+- **Rule of Inspection**: ALWAYS inspect the structure of returned objects before assuming key names.
+- **No Hallucination**: Never invent API names. If unsure, list the APIs for that app.
+- Work in small steps: inspect results before the next action.
 - When and ONLY when the task is fully done, call:
-    apis.supervisor.complete_task(answer=<answer>)   # answer=None if not a question
+    apis.supervisor.complete_task(answer=<answer>)
 """
 
 
-def call_llm(messages: list[dict]) -> str:
-    resp = client.messages.create(
-        model=MODEL,
-        system=SYSTEM_PROMPT,
-        messages=messages,
-        max_tokens=1500,
-        temperature=0.0,
-    )
-    return "".join(b.text for b in resp.content if b.type == "text")
+def call_llm(messages: list[dict], max_retries=3) -> str:
+    for attempt in range(max_retries):
+        try:
+            return llm.call(messages, SYSTEM_PROMPT)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(2 ** attempt)
 
 
 def extract_code(text: str) -> str:
+    # handle both ```python and ``` blocks
     m = re.search(r"```(?:python)?\s*\n(.*?)```", text, re.S)
-    return m.group(1).strip() if m else text.strip()
+    if m:
+        return m.group(1).strip()
+    # fallback: if no backticks, look for any indented block or just return the whole thing
+    # but the prompt says EXACTLY one block, so we'll be lenient
+    return text.strip()
 
 
-def solve(world: AppWorld) -> None:
+def solve(world: AppWorld, hydra_client=None, tenant_id=None) -> None:
+    # Ensure consistent and clean sub_tenant_id
+    # We'll use the supervisor's name slugified.
+    sub_tenant_id = re.sub(r'[^a-zA-Z0-9_]', '_', str(world.task.supervisor).lower())
+    if not sub_tenant_id:
+        sub_tenant_id = "default_agent_memory"
+
+    # 1. Deterministic Hard-Coded Workflow
+    init_code = '''
+try:
+    print("=== ACCOUNTS & PASSWORDS ===")
+    print(apis.supervisor.show_account_passwords())
+    print("\\n=== APP DESCRIPTIONS ===")
+    print(apis.api_docs.show_app_descriptions())
+except Exception as e:
+    print(f"Error fetching initial state: {e}")
+'''
+    init_output = world.execute(init_code)
+    
+    # 2. Query HydraDB for relevant past knowledge (if available)
+    hydra_context = ""
+    if hydra_client and tenant_id:
+        try:
+            print(f"  > Querying HydraDB: tenant={tenant_id}, sub_tenant={sub_tenant_id}")
+            res = hydra_client.query(
+                tenant_id=tenant_id,
+                sub_tenant_id=sub_tenant_id,
+                query=world.task.instruction,
+                type="all",
+                query_by="hybrid",
+                mode="thinking"
+            )
+            if hasattr(res, 'data') and res.data:
+                hydra_context = f"\nRelevant Memory (Lessons from past runs):\n{res.data}\n"
+        except Exception as e:
+            print(f"  ! HydraDB query error: {e}")
+
     messages = [{
         "role": "user",
         "content": (
             f"Supervisor: {world.task.supervisor}\n\n"
             f"Task: {world.task.instruction}\n\n"
-            "Begin. Remember: one python code block per turn."
+            f"Pre-fetched Initialization Output:\n{init_output}\n{hydra_context}\n"
+            "Begin. Remember: one python code block per turn. Store tokens in variables."
         ),
     }]
+    
+    trajectory = []
+    
     for step in range(MAX_INTERACTIONS):
         reply = call_llm(messages)
         code = extract_code(reply)
         output = world.execute(code)
+        
+        trajectory.append({"step": step, "code": code, "output": output})
         print(f"  step {step+1}: ran {len(code)} chars -> {str(output)[:120]!r}")
+        
         messages.append({"role": "assistant", "content": reply})
-        messages.append({"role": "user", "content": f"Execution output:\n{output}"})
+        
+        # 3. Error parsing and fallback logic
+        if "Exception:" in output or "Traceback" in output or "Error:" in output or "SyntaxError" in output:
+            messages.append({
+                "role": "user", 
+                "content": f"Execution failed with the following error output:\n{output}\nAnalyze the error, re-read the API docs if needed, fix the Python code, and try again."
+            })
+        else:
+            messages.append({"role": "user", "content": f"Execution output:\n{output}"})
+            
         if world.task_completed():
             print("  ✓ task_completed")
-            return
-    print("  ✗ hit MAX_INTERACTIONS without completion")
+            break
+    else:
+        print("  ✗ hit MAX_INTERACTIONS without completion")
+        
+    # 4. Ingest Trajectory to HydraDB (Learn from successes AND failures)
+    if hydra_client and tenant_id:
+        try:
+            # Generate a post-mortem summary
+            status = "SUCCESS" if world.task_completed() else "FAILURE"
+            
+            # Truncate trajectory outputs for the summary prompt
+            compact_trajectory = []
+            for t in trajectory:
+                compact_trajectory.append({
+                    "step": t["step"],
+                    "code": t["code"],
+                    "output": str(t["output"])[:500] + "..." if len(str(t["output"])) > 500 else str(t["output"])
+                })
+
+            summary_prompt = f"""Analyze this trajectory for Task: "{world.task.instruction}" (Status: {status}).
+Distill it into a structured 'Agent Guide' for future runs.
+
+Format your response as follows:
+[CORRECT PATTERN]
+- <Specific API call or logic that worked perfectly>
+- <Why it worked>
+
+[ERROR PATTERN]
+- <Specific code or assumption that triggered a failure>
+- <The error message received>
+- <How to avoid this exactly (e.g., 'Always check field X before Y')>
+
+[GOLDEN RULE]
+- <One-sentence mandatory instruction for this specific task type>
+
+Keep it technical, concise, and focused on code/APIs.
+"""
+            lesson_learned = llm.call([{"role": "user", "content": summary_prompt}], "You are an expert AppWorld debugger.")
+            
+            learning_payload = [{
+                "id": f"task_{world.task.id}",
+                "text": f"Task: {world.task.instruction}\nStatus: {status}\nLesson Learned: {lesson_learned}",
+                "infer": True
+            }]
+            
+            # Also ingest specific error fixes if they happened
+            for i in range(1, len(trajectory)):
+                out_prev = str(trajectory[i-1]["output"])
+                out_curr = str(trajectory[i]["output"])
+                if any(x in out_prev for x in ["Exception", "Error", "Traceback", "SyntaxError"]):
+                    if not any(x in out_curr for x in ["Exception", "Error", "Traceback", "SyntaxError"]):
+                        learning_payload.append({
+                            "id": f"fix_{world.task.id}_{i}",
+                            "text": f"Error fix for task '{world.task.instruction}':\nFailed Code: {trajectory[i-1]['code']}\nError: {out_prev}\nFixed Code: {trajectory[i]['code']}",
+                            "infer": True
+                        })
+
+            print(f"  > Ingesting {len(learning_payload)} lessons to HydraDB: tenant={tenant_id}, sub_tenant={sub_tenant_id}")
+            resp = hydra_client.context.ingest(
+                type="memory",
+                tenant_id=tenant_id,
+                sub_tenant_id=sub_tenant_id,
+                memories=json.dumps(learning_payload)
+            )
+            print(f"  ✓ Ingestion triggered. ID: {resp}")
+        except Exception as e:
+            print(f"  ! HydraDB ingestion error: {e}")
 
 
 def main() -> None:
+    # Initialize HydraDB
+    hydra_client = None
+    tenant_id = f"appworld_{EXPERIMENT}"
+    api_key = os.environ.get("HYDRA_DB_API_KEY") or os.environ.get("HYDRA_DB_KEY")
+    if USE_HYDRA and HydraDB and api_key:
+        hydra_client = HydraDB(token=api_key)
+        try:
+            hydra_client.tenants.create(tenant_id=tenant_id)
+            print("Waiting for HydraDB tenant to be ready...")
+            for _ in range(12):
+                status = hydra_client.tenants.status(tenant_id=tenant_id)
+                if status.data.infra.ready_for_ingestion:
+                    print("HydraDB tenant is ready.")
+                    break
+                time.sleep(5)
+        except Exception as e:
+            print(f"HydraDB init warning: {e}")
+
     task_ids = load_task_ids(DATASET)
     if MAX_TASKS:
         task_ids = task_ids[:MAX_TASKS]
@@ -120,7 +263,7 @@ def main() -> None:
         print(f"[{i}/{len(task_ids)}] {task_id}")
         with AppWorld(task_id=task_id, experiment_name=EXPERIMENT) as world:
             try:
-                solve(world)
+                solve(world, hydra_client, tenant_id)
             except Exception as e:  # never let one task kill the whole run
                 print(f"  ! error: {e}")
     print(f"\nDone. Outputs in ./experiments/outputs/{EXPERIMENT}/")

@@ -12,6 +12,7 @@ class LLMProvider:
         self._anthropic_client = None
         self._gemini_client = None
         self._groq_client = None
+        self._openrouter_client = None
 
     def _get_groq_client(self):
         if self._groq_client is None:
@@ -29,6 +30,22 @@ class LLMProvider:
             api_key = os.environ.get("OPENAI_API_KEY", "ollama")
             self._openai_client = OpenAI(base_url=base_url, api_key=api_key)
         return self._openai_client
+
+    def _get_openrouter_client(self):
+        if self._openrouter_client is None:
+            from openai import OpenAI
+            api_key = os.environ.get("OPENROUTER_API_KEY")
+            if not api_key:
+                raise ValueError("OPENROUTER_API_KEY not found in environment")
+            self._openrouter_client = OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=api_key,
+                default_headers={
+                    "HTTP-Referer": "https://github.com/interface4agi/hack_agent_arena",
+                    "X-Title": "Hack Agent Arena",
+                }
+            )
+        return self._openrouter_client
 
     def _get_anthropic_client(self):
         if self._anthropic_client is None:
@@ -54,6 +71,8 @@ class LLMProvider:
             return self._call_groq(messages, system_prompt, max_tokens, temperature)
         elif self.provider == "ollama" or self.provider == "openai":
             return self._call_openai(messages, system_prompt, max_tokens, temperature)
+        elif self.provider == "openrouter":
+            return self._call_openrouter(messages, system_prompt, max_tokens, temperature)
         elif self.provider == "anthropic":
             return self._call_anthropic(messages, system_prompt, max_tokens, temperature)
         elif self.provider == "gemini":
@@ -79,6 +98,17 @@ class LLMProvider:
 
     def _call_openai(self, messages, system_prompt, max_tokens, temperature):
         client = self._get_openai_client()
+        full_messages = [{"role": "system", "content": system_prompt}] + messages
+        resp = client.chat.completions.create(
+            model=self.model,
+            messages=full_messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return resp.choices[0].message.content
+
+    def _call_openrouter(self, messages, system_prompt, max_tokens, temperature):
+        client = self._get_openrouter_client()
         full_messages = [{"role": "system", "content": system_prompt}] + messages
         resp = client.chat.completions.create(
             model=self.model,
